@@ -25,24 +25,29 @@ defmodule Telepoison do
     :ok
   end
 
+  @impl HTTPoison.Base
   def process_request_headers(headers) when is_map(headers) do
     headers
     |> Enum.into([])
     |> process_request_headers()
   end
 
+  @impl HTTPoison.Base
   def process_request_headers(headers) when is_list(headers) do
     :otel_propagator_text_map.inject(headers)
   end
 
+  @impl HTTPoison.Base
   def request(%Request{options: opts} = request) do
     save_parent_ctx()
     span_name = Keyword.get_lazy(opts, :ot_span_name, fn -> compute_default_span_name(request) end)
+    %URI{host: host} = request.url |> process_request_url() |> URI.parse()
 
     attributes =
       [
         {"http.method", request.method |> Atom.to_string() |> String.upcase()},
-        {"http.url", request.url}
+        {"http.url", request.url},
+        {"net.peer.name", host}
       ] ++ Keyword.get(opts, :ot_attributes, [])
 
     request_ctx = Tracer.start_span(span_name, %{kind: :client, attributes: attributes})
@@ -64,6 +69,7 @@ defmodule Telepoison do
     result
   end
 
+  @impl HTTPoison.Base
   def process_response_status_code(status_code) do
     # https://github.com/open-telemetry/opentelemetry-specification/blob/master/specification/trace/semantic_conventions/http.md#status
     if status_code >= 400 do
@@ -73,6 +79,26 @@ defmodule Telepoison do
     Tracer.set_attribute("http.status_code", status_code)
     end_span()
     status_code
+  end
+
+  @impl HTTPoison.Base
+  def process_headers(headers) do
+    content_length =
+      Enum.find_value(headers, fn {header, value} ->
+        if String.downcase(header) == "content-length" do
+          value
+        else
+          nil
+        end
+      end)
+
+    with cl when not is_nil(cl) <- content_length,
+         {parsed, ""} <- Integer.parse(cl)
+      do
+      Tracer.set_attribute("http.response_content_length", parsed)
+    end
+
+    headers
   end
 
   defp end_span do
